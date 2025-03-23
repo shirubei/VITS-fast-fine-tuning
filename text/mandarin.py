@@ -1,11 +1,12 @@
 import os
 import sys
 import re
-from pypinyin import lazy_pinyin, BOPOMOFO
+from pypinyin import lazy_pinyin, BOPOMOFO, load_phrases_dict, Style
 import jieba
 import cn2an
 import logging
-
+import json
+from jieba import posseg
 
 # List of (Latin alphabet, bopomofo) pairs:
 _latin_to_bopomofo = [(re.compile('%s' % x[0], re.IGNORECASE), x[1]) for x in [
@@ -232,6 +233,66 @@ _bopomofo_to_ipa2 = [(re.compile('%s' % x[0]), x[1]) for x in [
     ('—', '-')
 ]]
 
+#1-4声的unicode的组合
+_four_tones_unicode = r'[\u02C9\u02CA\u02C7\u02CB]'
+
+#声调转换函数: 把带数字的拼音(fa1)转化为4声拼音(fā)
+def convert_tone(pinyin):
+    tone = re.search(r'\d', pinyin) 
+    if tone is not None:
+        tone_num = tone.group()
+        if tone_num == '1':
+            tone_dict = { #先处理i和u并列的case，然后再按照aoeiuǖ顺
+                'ui':'uī',
+                'iu':'iū',
+                'a': 'ā', 
+                'o': 'ō', 
+                'e': 'ē', 
+                'i': 'ī', 
+                'u': 'ū', 
+                'v': 'ǖ'
+            }
+        elif tone_num == '2':
+            tone_dict = {
+                'ui':'uí',
+                'iu':'iú',              
+                'a': 'á',               
+                'o': 'ó',               
+                'e': 'é',               
+                'i': 'í',               
+                'u': 'ú',   
+                'v': 'ǘ'
+            }
+        elif tone_num == '3':
+            tone_dict = {
+                'ui':'uǐ',
+                'iu':'iǔ',              
+                'a': 'ǎ',               
+                'o': 'ǒ',               
+                'e': 'ě',               
+                'i': 'ǐ',               
+                'u': 'ǔ',       
+                'v': 'ǚ'
+            }
+        else:
+            tone_dict = {
+                'ui':'uì',
+                'iu':'iù',
+                'a': 'à',
+                'o': 'ò',
+                'e': 'è',
+                'i': 'ì',
+                'u': 'ù',
+                'v': 'ǜ'
+            }
+            
+        for key, value in tone_dict.items():
+            if key in pinyin:
+                pinyin = pinyin.replace(key, value).replace("1","").replace("2","").replace("3","").replace("4","")
+                break
+    return pinyin
+    
+    
 
 def number_to_chinese(text):
     numbers = re.findall(r'\d+(?:\.?\d+)?', text)
@@ -241,14 +302,50 @@ def number_to_chinese(text):
 
 
 def chinese_to_bopomofo(text):
+    jieba.load_userdict("userdict.txt")
     text = text.replace('、', '，').replace('；', '，').replace('：', '，')
     words = jieba.lcut(text, cut_all=False)
     text = ''
-    for word in words:
+    
+    #加载多音字字典 数据来源 https://www.fuhaoku.net/duoyinzi/ 做了一点修正(删除注释，单一个字的部分以及生僻不常用的，保留98%以上)
+    with open("multi_pronaunce.json", encoding="utf-8") as f:
+        multi_dict = json.load(f)
+        
+    #转化为4声拼音(如：fā)并导入
+    multi_dict2 = {key: [[convert_tone(char)] for char in value.split()] for key, value in multi_dict.items()}
+    load_phrases_dict(multi_dict2) # 载入用户自定义的词语拼音库，pypinyin优先采用该字典中定义的词的发音
+    
+    for idx, word in enumerate(words):
         bopomofos = lazy_pinyin(word, BOPOMOFO)
         if not re.search('[\u4e00-\u9fff]', word):
             text += word
             continue
+        
+        # 检查是否是叠字（例如“奶奶”）
+        if len(word) == 2 and word[0] == word[1]:
+            bopomofos[1] = re.sub(_four_tones_unicode, '', bopomofos[1])  # 去掉声调表示轻声,但其实可以用上方一点(\u02D9)表示 
+
+        # 规则1: “不”后面是四声字时，“不”发第二声
+        if word == "不" and idx + 1 < len(words):
+            next_word_pinyin = lazy_pinyin(words[idx + 1], style=Style.TONE3)[0]
+            if next_word_pinyin[-1] == '4':  # 检查是否为四声
+                bopomofos[0] = re.sub(_four_tones_unicode, '', bopomofos[0]) + '\u02CA'  # 调整为第二声
+        
+        # 规则2 & 规则3: “一”的发音变化
+        if word == "一" and idx + 1 < len(words):
+            next_word_pinyin = lazy_pinyin(words[idx + 1], style=Style.TONE3)[0]
+            if next_word_pinyin[-1] == '4':  # 后面是四声
+                bopomofos[0] = re.sub(_four_tones_unicode, '', bopomofos[0]) + '\u02CA'  # 第二声
+            else:  # 除四声外
+                bopomofos[0] = re.sub(_four_tones_unicode, '', bopomofos[0]) + '\u02CB'  # 第四声
+        
+        # 规则4: 连续两个三声\u02C7，第一个变为二声
+        if idx > 0 and lazy_pinyin(words[idx - 1], style=Style.TONE3)[0][-1] == '3' and \
+           lazy_pinyin(word, style=Style.TONE3)[0][-1] == '3':
+            prev_bopomofo = lazy_pinyin(words[idx - 1], style=Style.BOPOMOFO)
+            prev_bopomofo[0] = re.sub(_four_tones_unicode, '', prev_bopomofo[0]) + '\u02CA'  # 第二声
+            text = text[:-(len(''.join(prev_bopomofo)))] + ''.join(prev_bopomofo)  # 更新结果
+        
         for i in range(len(bopomofos)):
             bopomofos[i] = re.sub(r'([\u3105-\u3129])$', r'\1ˉ', bopomofos[i])
         if text != '':
